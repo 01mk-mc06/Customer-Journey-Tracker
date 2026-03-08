@@ -1,0 +1,388 @@
+/*=============================================================================
+  Customer Journey Tracker - SQL Reference & Verification
+  
+  Purpose: Essential queries for checking data, testing security, and verifying setup
+  Date: March 2026
+=============================================================================*/
+
+-- switch to transformer role for most operations
+use role transformer_role;
+use warehouse transforming_wh;
+
+/*-----------------------------------------------------------------------------
+  SECTION 1: Check Seeds (Raw Data)
+-----------------------------------------------------------------------------*/
+
+use database raw;
+use schema staging_seeds;
+
+-- list all seed tables
+show tables in schema raw.staging_seeds;
+
+-- verify seed row counts
+select 'seed_customers' as table_name, count(*) as row_count from seed_customers
+union all
+select 'seed_customer_status_updates', count(*) from seed_customer_status_updates
+union all
+select 'seed_interaction_types', count(*) from seed_interaction_types
+union all
+select 'seed_interactions', count(*) from seed_interactions
+union all
+select 'seed_date_dimension', count(*) from seed_date_dimension;
+
+-- sample seed data
+select * from seed_customers limit 5;
+select * from seed_interactions limit 5;
+
+/*-----------------------------------------------------------------------------
+  SECTION 2: Check Staging Layer
+-----------------------------------------------------------------------------*/
+
+use database analytics;
+use schema staging_staging;
+
+-- list all staging views
+show views in schema analytics.staging_staging;
+
+-- verify staging row counts
+select 'stg_customers_with_updates' as view_name, count(*) as row_count from stg_customers_with_updates
+union all
+select 'stg_customer_status_updates', count(*) from stg_customer_status_updates
+union all
+select 'stg_interaction_types', count(*) from stg_interaction_types
+union all
+select 'stg_interactions', count(*) from stg_interactions
+union all
+select 'stg_dates', count(*) from stg_dates;
+
+-- sample staging data
+select * from stg_customers_with_updates limit 5;
+select * from stg_interactions limit 5;
+
+/*-----------------------------------------------------------------------------
+  SECTION 3: Check Snapshots (SCD Type 2)
+-----------------------------------------------------------------------------*/
+
+use database analytics;
+use schema snapshots;
+
+-- list snapshot tables
+show tables in schema analytics.snapshots;
+
+-- verify snapshot row counts
+select 
+    count(*) as total_records,
+    count(distinct customer_id) as unique_customers,
+    count(case when dbt_valid_to is null then 1 end) as current_records,
+    count(case when dbt_valid_to is not null then 1 end) as historical_records
+from snap_customer_status_v2;
+
+-- find customers with status changes (SCD Type 2 in action)
+select 
+    customer_id,
+    count(*) as num_versions
+from snap_customer_status_v2
+group by customer_id
+having count(*) > 1
+order by num_versions desc
+limit 10;
+
+-- view customer journey (full history)
+select 
+    customer_id,
+    customer_name,
+    status,
+    dbt_valid_from,
+    dbt_valid_to,
+    datediff('day', dbt_valid_from, coalesce(dbt_valid_to, current_timestamp())) as days_in_status,
+    case when dbt_valid_to is null then 'CURRENT' else 'HISTORICAL' end as record_type
+from snap_customer_status_v2
+where customer_id = (
+    select customer_id 
+    from snap_customer_status_v2 
+    group by customer_id 
+    having count(*) > 1 
+    limit 1
+)
+order by dbt_valid_from;
+
+-- point-in-time query: who was in trial status on feb 1, 2024?
+select 
+    customer_id,
+    customer_name,
+    status,
+    dbt_valid_from,
+    dbt_valid_to
+from snap_customer_status_v2
+where status = 'trial'
+  and dbt_valid_from <= '2024-02-01'
+  and (dbt_valid_to > '2024-02-01' or dbt_valid_to is null)
+limit 10;
+
+/*-----------------------------------------------------------------------------
+  SECTION 4: Check Intermediate Layer
+-----------------------------------------------------------------------------*/
+
+use database analytics;
+use schema staging_intermediate;
+
+-- list all intermediate objects
+show views in schema analytics.staging_intermediate;
+show tables in schema analytics.staging_intermediate;
+
+-- get detailed info
+select 
+    table_name,
+    table_type,
+    row_count,
+    bytes,
+    created as created_date
+from analytics.information_schema.tables
+where table_schema = 'STAGING_INTERMEDIATE'
+order by table_name;
+
+-- verify intermediate row counts
+select 'int_customers_deduplicated' as model_name, count(*) as row_count 
+from int_customers_deduplicated
+union all
+select 'int_customer_lifecycle_metrics', count(*) 
+from int_customer_lifecycle_metrics
+union all
+select 'int_customer_interactions_sessionized', count(*) 
+from int_customer_interactions_sessionized
+union all
+select 'test_sessions', count(*) 
+from test_sessions;
+
+-- verify sessionization worked
+select 
+    count(distinct customer_id) as customers,
+    count(distinct session_id) as sessions,
+    count(*) as interactions
+from int_customer_interactions_sessionized;
+
+-- sample sessionized data
+select 
+    customer_id,
+    session_id,
+    interaction_type,
+    interaction_timestamp,
+    session_sequence,
+    minutes_since_last_interaction,
+    is_new_session
+from int_customer_interactions_sessionized
+where customer_id = (select customer_id from int_customer_interactions_sessionized limit 1)
+order by interaction_timestamp
+limit 10;
+
+/*-----------------------------------------------------------------------------
+  SECTION 5: Check Marts Layer
+-----------------------------------------------------------------------------*/
+
+use database analytics;
+use schema staging_marts;
+
+-- list all mart tables
+show tables in schema analytics.staging_marts;
+
+-- verify mart row counts
+select 'dim_customers_current' as table_name, count(*) as row_count from dim_customers_current
+union all
+select 'dim_customers_historical', count(*) from dim_customers_historical
+union all
+select 'dim_dates', count(*) from dim_dates
+union all
+select 'dim_interaction_types', count(*) from dim_interaction_types
+union all
+select 'fct_customer_interactions', count(*) from fct_customer_interactions
+union all
+select 'fct_customer_lifetime_value', count(*) from fct_customer_lifetime_value;
+
+-- sample mart data: customer lifetime value
+select 
+    customer_id,
+    segment,
+    current_status,
+    total_interactions,
+    total_sessions,
+    avg_sentiment_score,
+    resolution_rate,
+    customer_health_status,
+    total_days_as_customer
+from fct_customer_lifetime_value
+limit 10;
+
+-- sample mart data: interactions fact
+select 
+    interaction_id,
+    customer_id,
+    interaction_type,
+    channel,
+    duration_seconds,
+    sentiment_score,
+    resolution_status,
+    session_id
+from fct_customer_interactions
+limit 10;
+
+/*-----------------------------------------------------------------------------
+  SECTION 6: Test Security (PII Masking)
+-----------------------------------------------------------------------------*/
+
+-- test as analyst role (should see masked data)
+use role analyst_role;
+use warehouse reporting_wh;
+use database analytics;
+use schema staging_intermediate;
+
+select 
+    customer_id,
+    customer_name,  -- should be masked: 'M*** Santos'
+    email,          -- should be masked: 'm***@gmail.com'
+    phone,          -- should be masked: '+63-***-***-4567'
+    segment,
+    status
+from int_customers_deduplicated
+limit 5;
+
+-- verify row access policy (should only see smb and consumer)
+select 
+    segment,
+    count(*) as customer_count
+from int_customers_deduplicated
+group by segment
+order by segment;
+-- expected: only 'consumer' and 'smb' (no 'enterprise')
+
+-- switch back to transformer role (should see full data)
+use role transformer_role;
+use warehouse transforming_wh;
+use schema staging_intermediate;
+
+select 
+    customer_id,
+    customer_name,  -- should be unmasked: full name
+    email,          -- should be unmasked: full email
+    phone,          -- should be unmasked: full phone
+    segment,
+    status
+from int_customers_deduplicated
+limit 5;
+
+-- verify all segments visible (including enterprise)
+select 
+    segment,
+    count(*) as customer_count
+from int_customers_deduplicated
+group by segment
+order by segment;
+-- expected: 'consumer', 'enterprise', 'smb'
+
+/*-----------------------------------------------------------------------------
+  SECTION 7: Verify Masking Policies
+-----------------------------------------------------------------------------*/
+
+use role accountadmin;
+use database analytics;
+
+-- check masking policies exist
+show masking policies in database analytics;
+
+-- check row access policies exist
+show row access policies in database analytics;
+
+-- view policy assignments on specific table
+use schema staging_intermediate;
+desc view int_customers_deduplicated;
+
+/*-----------------------------------------------------------------------------
+  SECTION 8: Data Quality Checks
+-----------------------------------------------------------------------------*/
+
+use role transformer_role;
+use database analytics;
+use schema staging_marts;
+
+-- check for null values in critical columns
+select 'dim_customers_current' as table_name,
+       sum(case when customer_id is null then 1 else 0 end) as null_customer_id,
+       sum(case when segment is null then 1 else 0 end) as null_segment,
+       sum(case when status is null then 1 else 0 end) as null_status
+from dim_customers_current;
+
+-- check for duplicates in primary keys
+select 
+    customer_id,
+    count(*) as duplicate_count
+from dim_customers_current
+group by customer_id
+having count(*) > 1;
+
+-- verify fact table grain
+select 
+    interaction_id,
+    count(*) as duplicate_count
+from fct_customer_interactions
+group by interaction_id
+having count(*) > 1;
+
+-- check sentiment score ranges
+select 
+    min(sentiment_score) as min_sentiment,
+    max(sentiment_score) as max_sentiment,
+    avg(sentiment_score) as avg_sentiment
+from fct_customer_interactions;
+-- expected: min = -1.0, max = 1.0
+
+-- check for orphaned records (interactions without customers)
+select count(*) as orphaned_interactions
+from fct_customer_interactions f
+left join dim_customers_current d on f.customer_key = d.customer_key
+where d.customer_key is null;
+-- expected: 0
+
+/*-----------------------------------------------------------------------------
+  SECTION 9: Performance Metrics
+-----------------------------------------------------------------------------*/
+
+-- table sizes and row counts
+select 
+    table_schema,
+    table_name,
+    row_count,
+    bytes / (1024 * 1024) as size_mb
+from analytics.information_schema.tables
+where table_schema in ('STAGING_STAGING', 'STAGING_INTERMEDIATE', 'STAGING_MARTS', 'SNAPSHOTS')
+  and table_type in ('BASE TABLE', 'VIEW')
+order by bytes desc;
+
+/*-----------------------------------------------------------------------------
+  SECTION 10: Quick Health Check (Run This First)
+-----------------------------------------------------------------------------*/
+
+-- comprehensive health check
+use role transformer_role;
+
+select 'Seeds Loaded' as check_type, count(*) as count from raw.staging_seeds.seed_customers
+union all
+select 'Staging Views', count(*) from analytics.information_schema.views where table_schema = 'STAGING_STAGING'
+union all
+select 'Intermediate Models', count(*) from analytics.information_schema.tables where table_schema = 'STAGING_INTERMEDIATE'
+union all
+select 'Mart Tables', count(*) from analytics.information_schema.tables where table_schema = 'STAGING_MARTS'
+union all
+select 'Snapshots', count(*) from analytics.information_schema.tables where table_schema = 'SNAPSHOTS'
+union all
+select 'Total Interactions', count(*) from analytics.staging_marts.fct_customer_interactions
+union all
+select 'Total Customers', count(*) from analytics.staging_marts.dim_customers_current;
+
+/*=============================================================================
+  END OF REFERENCE QUERIES
+  
+  Quick Start:
+  1. Run Section 10 (Quick Health Check) first
+  2. Run Section 6 (Test Security) to verify masking
+  3. Run Section 3 (Snapshots) to see SCD Type 2 in action
+  4. Browse other sections as needed
+=============================================================================*/
