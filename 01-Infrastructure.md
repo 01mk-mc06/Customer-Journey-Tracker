@@ -1,4 +1,4 @@
-# Part 1: Infrastructure Setup
+# Infrastructure Setup
 
 ## Overview
 Set up Snowflake infrastructure with proper role-based access control (RBAC), warehouses, databases, and schemas for the dbt project.
