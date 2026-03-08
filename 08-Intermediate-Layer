@@ -1,0 +1,891 @@
+# Intermediate Layer
+
+## Overview
+Build the intermediate layer with business logic including customer deduplication, interaction sessionization with 30-minute timeout rule, and customer lifecycle metrics.
+
+## Objectives
+- Create customer deduplication model
+- Implement sessionization logic with custom macro
+- Build customer lifecycle metrics
+- Use window functions effectively
+- Decide view vs table materialization
+- Create debugging/testing models
+
+## Prerequisites
+- Part 7 completed (snapshots created)
+- Understanding of window functions
+- Familiarity with CTEs
+- Knowledge of ROW_NUMBER(), LAG(), SUM() OVER()
+
+---
+
+## Intermediate Layer Principles
+
+### Purpose
+- Apply business logic and calculations
+- Prepare data for marts
+- Handle complex transformations
+- Create reusable building blocks
+
+### Materialization Strategy
+- Default: views (lightweight, easy to change)
+- Tables for: complex window functions, large datasets, frequently queried
+- Ephemeral: only if used in single downstream model
+
+### Key Patterns
+- Deduplication with ROW_NUMBER()
+- Sessionization with LAG() and window functions
+- Lifecycle state machines
+- Metric calculations
+
+---
+
+## Step 1: Create Customer Deduplication Model
+
+### Purpose
+Remove duplicate customer_ids, keeping the most recently updated record.
+
+### File Location
+models/intermediate/int_customers_deduplicated.sql
+
+### Implementation
+```sql
+{{
+    config(
+        materialized='view',
+        tags=['intermediate', 'customers']
+    )
+}}
+
+/*
+    Customer Deduplication Model
+    
+    Purpose: Remove 10 intentional duplicate customer records
+    Logic: Keep most recently updated record per customer_id
+    
+    Deduplication Strategy:
+    - ROW_NUMBER() partitioned by customer_id
+    - Ordered by updated_at DESC (most recent first)
+    - Filter to rn = 1 (keep only first row)
+*/
+
+with source as (
+    select * from {{ ref('stg_customers_with_updates') }}
+),
+
+deduplicated as (
+    select
+        *,
+        row_number() over (
+            partition by customer_id 
+            order by updated_at desc
+        ) as rn
+    from source
+),
+
+final as (
+    select
+        -- Core fields
+        customer_id,
+        customer_name,
+        email,
+        phone,
+        segment,
+        status,
+        created_at,
+        updated_at,
+        updated_by,
+        
+        -- Deduplication metadata
+        case when rn > 1 then true else false end as was_duplicate,
+        max(rn) over (partition by customer_id) - 1 as num_duplicates_removed,
+        
+        -- Audit
+        dbt_loaded_at
+        
+    from deduplicated
+    where rn = 1
+)
+
+select * from final
+```
+
+### Design Decisions
+
+**Why ROW_NUMBER()?**
+- Deterministic (always same result)
+- Allows ordering by any column
+- Better than DISTINCT (can't control which row kept)
+
+**Why ORDER BY updated_at DESC?**
+- Keeps most recent data
+- Business rule: latest update is truth
+- Could use created_at or other columns if needed
+
+**Why Add Metadata?**
+- was_duplicate flag: identify which customers had dupes
+- num_duplicates_removed: count how many removed
+- Useful for data quality reporting
+
+### Expected Results
+```sql
+-- Before deduplication: 1,010 rows
+-- After deduplication: 1,000 rows
+-- Duplicates removed: 10
+```
+
+---
+
+## Step 2: Create Sessionization Custom Macro
+
+### Purpose
+Calculate time gap between interactions for sessionization logic.
+
+### File Location
+macros/calculate_session_gap.sql
+
+### Implementation
+```sql
+{% macro calculate_session_gap(timestamp_column, partition_by) %}
+    /*
+        Calculate time gap in minutes since last interaction
+        
+        Args:
+            timestamp_column: Column containing interaction timestamp
+            partition_by: Column(s) to partition by (usually customer_id)
+        
+        Returns: Minutes since last interaction (NULL for first interaction)
+        
+        Usage:
+            {{ calculate_session_gap('interaction_timestamp', 'customer_id') }}
+    */
+    
+    datediff(
+        'minute',
+        lag({{ timestamp_column }}) over (
+            partition by {{ partition_by }}
+            order by {{ timestamp_column }}
+        ),
+        {{ timestamp_column }}
+    )
+    
+{% endmacro %}
+```
+
+### Macro Benefits
+- Reusable logic
+- Consistent calculation across models
+- Easy to modify timeout threshold
+- Self-documenting code
+
+---
+
+## Step 3: Create Sessionization Model
+
+### Purpose
+Group interactions into sessions based on 30-minute inactivity timeout.
+
+### Business Rule
+- Sessions separated by 30+ minute gaps
+- Within-session: interactions < 30 minutes apart
+- Each customer has independent sessions
+
+### File Location
+models/intermediate/int_customer_interactions_sessionized.sql
+
+### Implementation
+```sql
+{{
+    config(
+        materialized='table',
+        tags=['intermediate', 'interactions', 'sessionization']
+    )
+}}
+
+/*
+    Customer Interaction Sessionization
+    
+    Purpose: Group interactions into sessions based on 30-minute timeout rule
+    
+    Business Rule:
+    - Interactions within 30 minutes = same session
+    - Gap >= 30 minutes = new session
+    
+    Sessionization Logic (4 Steps):
+    1. Calculate time gap since last interaction per customer
+    2. Identify session boundaries (gaps >= 30 minutes)
+    3. Assign session numbers with running sum
+    4. Generate session_id surrogate key
+*/
+
+with interactions as (
+    select * from {{ ref('stg_interactions') }}
+),
+
+-- STEP 1: Calculate time gaps between interactions
+interactions_with_gaps as (
+    select
+        interaction_id,
+        customer_id,
+        interaction_type,
+        interaction_timestamp,
+        duration_seconds,
+        channel,
+        sentiment_score,
+        resolution_status,
+        
+        -- Calculate minutes since last interaction using macro
+        {{ calculate_session_gap('interaction_timestamp', 'customer_id') }} as minutes_since_last_interaction
+        
+    from interactions
+),
+
+-- STEP 2: Identify session boundaries (gap >= 30 minutes or first interaction)
+session_boundaries as (
+    select
+        *,
+        case
+            when minutes_since_last_interaction is null then 1  -- First interaction
+            when minutes_since_last_interaction >= 30 then 1    -- New session
+            else 0                                               -- Same session
+        end as is_new_session
+        
+    from interactions_with_gaps
+),
+
+-- STEP 3: Assign session numbers with running sum
+sessions_numbered as (
+    select
+        *,
+        sum(is_new_session) over (
+            partition by customer_id
+            order by interaction_timestamp
+            rows between unbounded preceding and current row
+        ) as session_sequence
+        
+    from session_boundaries
+),
+
+-- STEP 4: Generate session_id and final output
+final as (
+    select
+        -- Surrogate key for this interaction
+        {{ dbt_utils.generate_surrogate_key(['interaction_id']) }} as interaction_key,
+        
+        -- Session identifier (customer_id + session_sequence)
+        {{ dbt_utils.generate_surrogate_key(['customer_id', 'session_sequence']) }} as session_id,
+        
+        -- Core fields
+        interaction_id,
+        customer_id,
+        interaction_type,
+        interaction_timestamp,
+        duration_seconds,
+        channel,
+        sentiment_score,
+        resolution_status,
+        
+        -- Session metadata
+        session_sequence,
+        minutes_since_last_interaction,
+        is_new_session,
+        
+        -- Audit
+        current_timestamp() as dbt_loaded_at
+        
+    from sessions_numbered
+)
+
+select * from final
+```
+
+### Sessionization Logic Explained
+
+**Step 1: Calculate Gaps**
+```sql
+LAG(interaction_timestamp) OVER (PARTITION BY customer_id ORDER BY interaction_timestamp)
+```
+- Gets previous interaction timestamp for same customer
+- Returns NULL for first interaction
+- Calculate minutes difference
+
+**Step 2: Identify Boundaries**
+```sql
+CASE 
+    WHEN minutes_since_last >= 30 THEN 1  -- New session
+    ELSE 0                                 -- Same session
+END
+```
+- Flag session boundaries
+- 1 = start of new session
+- 0 = continuation of current session
+
+**Step 3: Assign Session Numbers**
+```sql
+SUM(is_new_session) OVER (
+    PARTITION BY customer_id
+    ORDER BY interaction_timestamp
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+)
+```
+- Running sum of boundary flags
+- Creates incrementing session numbers: 1, 1, 1, 2, 2, 3, etc.
+- Each customer starts at 1
+
+**Step 4: Generate Session ID**
+```sql
+dbt_utils.generate_surrogate_key(['customer_id', 'session_sequence'])
+```
+- Creates unique session identifier
+- MD5 hash of customer_id + session_sequence
+- Consistent across runs
+
+### Why Materialized as Table?
+- Complex window functions (expensive to recompute)
+- Used by multiple downstream models
+- Relatively small result set (5,775 rows)
+- Worth storing for performance
+
+---
+
+## Step 4: Create Test Sessions Debug Model
+
+### Purpose
+Debugging model to inspect sessionization results.
+
+### File Location
+models/intermediate/test_sessions.sql
+
+### Implementation
+```sql
+{{
+    config(
+        materialized='table',
+        tags=['intermediate', 'debug', 'sessions']
+    )
+}}
+
+/*
+    Session Testing and Debugging Model
+    
+    Purpose: Inspect sessionization logic
+    
+    Useful for:
+    - Verifying session boundaries correct
+    - Checking 30-minute timeout rule
+    - Debugging session assignment issues
+*/
+
+with sessionized as (
+    select * from {{ ref('int_customer_interactions_sessionized') }}
+),
+
+session_summary as (
+    select
+        session_id,
+        customer_id,
+        session_sequence,
+        count(*) as interactions_in_session,
+        min(interaction_timestamp) as session_start,
+        max(interaction_timestamp) as session_end,
+        
+        -- Calculate session duration
+        datediff(
+            'minute',
+            min(interaction_timestamp),
+            max(interaction_timestamp)
+        ) as session_duration_minutes,
+        
+        -- Aggregate session metrics
+        avg(duration_seconds) as avg_interaction_duration,
+        avg(sentiment_score) as avg_sentiment,
+        sum(case when resolution_status = 'resolved' then 1 else 0 end) as resolved_count
+        
+    from sessionized
+    group by session_id, customer_id, session_sequence
+)
+
+select * from session_summary
+order by customer_id, session_sequence
+```
+
+### Use Cases
+- Verify no sessions have interactions > 30 minutes apart
+- Check session start/end times make sense
+- Validate interactions per session reasonable (typically 1-5)
+- Identify anomalies
+
+---
+
+## Step 5: Create Customer Lifecycle Metrics
+
+### Purpose
+Track customer status transitions and lifecycle stages using snapshot data.
+
+### File Location
+models/intermediate/int_customer_lifecycle_metrics.sql
+
+### Implementation
+```sql
+{{
+    config(
+        materialized='view',
+        tags=['intermediate', 'customers', 'lifecycle']
+    )
+}}
+
+/*
+    Customer Lifecycle Metrics
+    
+    Purpose: Track customer journey through status changes
+    Source: snap_customer_status_v2 (SCD Type 2 snapshot)
+    
+    Metrics:
+    - Days in each status
+    - Status transitions
+    - Lifecycle stages
+    - Transition health indicators
+*/
+
+with snapshot as (
+    select * from {{ ref('snap_customer_status_v2') }}
+),
+
+lifecycle as (
+    select
+        customer_id,
+        customer_name,
+        segment,
+        status,
+        
+        -- SCD metadata
+        dbt_valid_from,
+        dbt_valid_to,
+        dbt_scd_id,
+        
+        -- Calculate days in this status
+        datediff(
+            'day',
+            dbt_valid_from,
+            coalesce(dbt_valid_to, current_timestamp())
+        ) as days_in_status,
+        
+        -- Is this the current status?
+        case when dbt_valid_to is null then true else false end as is_current_status,
+        
+        -- Map status to lifecycle stage
+        case
+            when status = 'lead' then 'acquisition'
+            when status = 'trial' then 'activation'
+            when status = 'paid' then 'retention'
+            when status = 'at_risk' then 'retention'
+            when status = 'churned' then 'churn'
+            else 'unknown'
+        end as lifecycle_stage,
+        
+        -- Get previous status for transition analysis
+        lag(status) over (
+            partition by customer_id
+            order by dbt_valid_from
+        ) as previous_status,
+        
+        -- Transition health (positive, negative, neutral)
+        case
+            -- Positive transitions
+            when lag(status) over (partition by customer_id order by dbt_valid_from) = 'lead' 
+                and status = 'trial' then 'positive'
+            when lag(status) over (partition by customer_id order by dbt_valid_from) = 'trial' 
+                and status = 'paid' then 'positive'
+            when lag(status) over (partition by customer_id order by dbt_valid_from) = 'at_risk' 
+                and status = 'paid' then 'positive'
+            
+            -- Negative transitions
+            when status = 'churned' then 'negative'
+            when status = 'at_risk' then 'warning'
+            
+            -- Neutral (first status or staying same)
+            else 'neutral'
+        end as transition_health,
+        
+        -- Audit
+        current_timestamp() as dbt_loaded_at
+        
+    from snapshot
+)
+
+select * from lifecycle
+order by customer_id, dbt_valid_from
+```
+
+### Lifecycle Stage Mapping
+
+**Acquisition:** lead
+- First contact with customer
+- Not yet engaged
+
+**Activation:** trial
+- Actively trying product/service
+- Engaged but not paying
+
+**Retention:** paid, at_risk
+- Paying customers
+- May need attention (at_risk)
+
+**Churn:** churned
+- No longer active
+- Lost customer
+
+### Transition Health Logic
+
+**Positive:**
+- lead -> trial (engaged)
+- trial -> paid (converted)
+- at_risk -> paid (saved)
+
+**Negative:**
+- any -> churned (lost)
+
+**Warning:**
+- any -> at_risk (needs attention)
+
+**Neutral:**
+- First status (no transition)
+- No change
+
+---
+
+## Step 6: Build All Intermediate Models
+
+### Purpose
+Execute dbt run to create intermediate layer.
+
+### Implementation
+```powershell
+# Build all intermediate models
+dbt run --select intermediate
+
+# Or build incrementally
+dbt run --select int_customers_deduplicated
+dbt run --select int_customer_interactions_sessionized
+dbt run --select int_customer_lifecycle_metrics
+dbt run --select test_sessions
+```
+
+### Expected Output
+```
+Running with dbt=1.8.0
+Found 4 models
+
+1 of 4 START sql view model staging_intermediate.int_customers_deduplicated ... [RUN]
+2 of 4 START sql view model staging_intermediate.int_customer_lifecycle_metrics [RUN]
+1 of 4 OK created sql view model staging_intermediate.int_customers_deduplicated [SUCCESS 1 in 2.1s]
+3 of 4 START sql table model staging_intermediate.int_customer_interactions_sessionized [RUN]
+2 of 4 OK created sql view model staging_intermediate.int_customer_lifecycle_metrics [SUCCESS 1 in 2.3s]
+4 of 4 START sql table model staging_intermediate.test_sessions ........... [RUN]
+3 of 4 OK created sql table model staging_intermediate.int_customer_interactions_sessionized [SUCCESS 1 in 3.5s]
+4 of 4 OK created sql table model staging_intermediate.test_sessions ...... [SUCCESS 1 in 2.8s]
+
+Completed successfully
+```
+
+---
+
+## Step 7: Verify Intermediate Models
+
+### Check Models Created
+```sql
+use database analytics;
+use schema staging_intermediate;
+
+-- List all objects
+show views in schema analytics.staging_intermediate;
+show tables in schema analytics.staging_intermediate;
+
+-- Expected:
+-- Views: int_customers_deduplicated, int_customer_lifecycle_metrics
+-- Tables: int_customer_interactions_sessionized, test_sessions
+```
+
+### Verify Row Counts
+```sql
+select 'int_customers_deduplicated' as model, count(*) as rows 
+from int_customers_deduplicated
+union all
+select 'int_customer_lifecycle_metrics', count(*) 
+from int_customer_lifecycle_metrics
+union all
+select 'int_customer_interactions_sessionized', count(*) 
+from int_customer_interactions_sessionized
+union all
+select 'test_sessions', count(*) 
+from test_sessions;
+
+-- Expected:
+-- int_customers_deduplicated: 1,000 (duplicates removed)
+-- int_customer_lifecycle_metrics: varies (1 row per status change)
+-- int_customer_interactions_sessionized: 5,775 (all interactions)
+-- test_sessions: number of unique sessions
+```
+
+### Verify Deduplication Worked
+```sql
+-- Should be 0 duplicates
+select customer_id, count(*)
+from int_customers_deduplicated
+group by customer_id
+having count(*) > 1;
+
+-- Check metadata
+select
+    count(*) as total_customers,
+    sum(case when was_duplicate then 1 else 0 end) as had_duplicates,
+    sum(num_duplicates_removed) as total_dupes_removed
+from int_customers_deduplicated;
+
+-- Expected: had_duplicates = 10, total_dupes_removed = 10
+```
+
+### Verify Sessionization
+```sql
+-- Check session stats
+select 
+    count(distinct customer_id) as customers,
+    count(distinct session_id) as sessions,
+    count(*) as interactions,
+    round(count(*)::float / count(distinct session_id), 1) as avg_interactions_per_session
+from int_customer_interactions_sessionized;
+
+-- Sample sessionized data
+select 
+    customer_id,
+    session_id,
+    session_sequence,
+    interaction_timestamp,
+    minutes_since_last_interaction,
+    is_new_session
+from int_customer_interactions_sessionized
+where customer_id = (select customer_id from int_customer_interactions_sessionized limit 1)
+order by interaction_timestamp
+limit 10;
+```
+
+### Verify Session Timeout Rule
+```sql
+-- Check for any within-session gaps >= 30 minutes (should be 0)
+select
+    session_id,
+    max(minutes_since_last_interaction) as max_gap_in_session
+from int_customer_interactions_sessionized
+where is_new_session = 0  -- Only look at non-boundary interactions
+group by session_id
+having max(minutes_since_last_interaction) >= 30;
+
+-- Expected: 0 rows (all within-session gaps < 30 minutes)
+```
+
+---
+
+## Troubleshooting
+
+### Issue: Deduplication Not Working
+**Problem:** Still have duplicate customer_ids
+
+**Solution:**
+```sql
+-- Check ROW_NUMBER logic
+select 
+    customer_id,
+    updated_at,
+    row_number() over (partition by customer_id order by updated_at desc) as rn
+from stg_customers_with_updates
+where customer_id in (
+    select customer_id from stg_customers_with_updates
+    group by customer_id having count(*) > 1
+);
+
+-- Verify WHERE rn = 1 is in final CTE
+```
+
+### Issue: Session Boundaries Incorrect
+**Problem:** Interactions grouped incorrectly
+
+**Solution:**
+```sql
+-- Debug session boundaries
+select 
+    customer_id,
+    interaction_timestamp,
+    minutes_since_last_interaction,
+    is_new_session,
+    session_sequence
+from int_customer_interactions_sessionized
+order by customer_id, interaction_timestamp
+limit 50;
+
+-- Check for sessions with long gaps
+select * from test_sessions
+where session_duration_minutes > 30;
+```
+
+### Issue: LAG() Returns Unexpected Results
+**Problem:** Time gaps calculated wrong
+
+**Solution:**
+- Verify PARTITION BY customer_id (not missing)
+- Check ORDER BY interaction_timestamp (not other column)
+- Ensure timestamp column not NULL
+- Verify datediff() units (minutes not hours)
+
+### Issue: Materialization Error
+**Problem:** Can't materialize as table
+
+**Solution:**
+```sql
+-- Check permissions
+use role transformer_role;
+show grants on schema analytics.staging_intermediate;
+
+-- Manually create table if needed
+create table analytics.staging_intermediate.int_customer_interactions_sessionized as
+select * from analytics.staging_staging.stg_interactions limit 0;
+```
+
+### Issue: Performance Problems
+**Problem:** Sessionization model too slow
+
+**Solution:**
+- Add clustering on customer_id, interaction_timestamp
+- Use incremental materialization for large datasets
+- Consider partitioning by date
+- Optimize window function ordering
+
+---
+
+## Best Practices Summary
+
+### Window Functions
+1. Always specify PARTITION BY and ORDER BY explicitly
+2. Use ROWS BETWEEN for running calculations
+3. Test window logic on small dataset first
+4. Consider performance impact (use tables for complex windows)
+
+### Sessionization
+1. Document timeout rule clearly (30 minutes)
+2. Handle first interaction (NULL time gap)
+3. Generate deterministic session IDs
+4. Create debug models for verification
+
+### Deduplication
+1. Use ROW_NUMBER() not DISTINCT
+2. Order by meaningful column (updated_at)
+3. Add metadata (was_duplicate flag)
+4. Document deduplication logic
+
+### Materialization
+1. Default to views (easy to change)
+2. Use tables for: complex queries, frequently accessed, large datasets
+3. Avoid ephemeral unless single downstream use
+4. Monitor build times
+
+---
+
+## Common Patterns
+
+### Pattern 1: Deduplication with ROW_NUMBER
+```sql
+with deduped as (
+    select *,
+        row_number() over (
+            partition by unique_key
+            order by priority_column desc
+        ) as rn
+    from source
+)
+select * from deduped where rn = 1
+```
+
+### Pattern 2: Running Sum for Grouping
+```sql
+sum(boundary_flag) over (
+    partition by group_key
+    order by sort_column
+    rows between unbounded preceding and current row
+)
+```
+
+### Pattern 3: LAG for Previous Value
+```sql
+lag(column_name, 1) over (
+    partition by group_key
+    order by sort_column
+) as previous_value
+```
+
+### Pattern 4: Days Between Dates with COALESCE
+```sql
+datediff(
+    'day',
+    start_date,
+    coalesce(end_date, current_timestamp())
+) as days_duration
+```
+
+---
+
+## View vs Table Decision Matrix
+
+**Use VIEW when:**
+- Simple transformations
+- Source data changes frequently
+- Low query volume
+- Storage optimization important
+
+**Use TABLE when:**
+- Complex window functions
+- High query volume
+- Source rarely changes
+- Query performance critical
+- Downstream models join to it
+
+**Use EPHEMERAL when:**
+- Only one downstream model
+- Very simple transformation
+- Want to avoid clutter
+
+---
+
+## Verification Checklist
+
+Before proceeding to Part 9:
+- [ ] 4 intermediate models created
+- [ ] Deduplication removes 10 duplicates
+- [ ] Sessionization creates sessions correctly
+- [ ] 30-minute timeout rule enforced
+- [ ] Session IDs unique and consistent
+- [ ] Lifecycle metrics calculated
+- [ ] test_sessions model useful for debugging
+- [ ] All models query successfully
+
+---
+
+## Next Steps
+
+After completing intermediate layer:
+1. Implement data governance and security (Part 9)
+2. Build marts on top of intermediate models (Part 10)
+3. Create comprehensive documentation
+
+---
+
+## Estimated Time
+- Model creation: 60-90 minutes
+- Building and verification: 15-20 minutes
+- Debugging: 15-30 minutes (if needed)
+- Total: 90-120 minutes
+
+## Success Criteria
+- All 4 intermediate models built
+- Deduplication working correctly
+- Sessionization logic validated
+- Lifecycle metrics calculated
+- Ready for security implementation in Part 9
