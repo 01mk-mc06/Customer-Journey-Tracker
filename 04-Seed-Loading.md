@@ -1,4 +1,4 @@
-# Part 4: Seed Loading and Sources Configuration
+# Seed Loading and Sources Configuration
 
 ## Overview
 Load CSV seed data into Snowflake using dbt seed command and configure sources.yml to reference the loaded tables.
