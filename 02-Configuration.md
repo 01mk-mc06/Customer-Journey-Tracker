@@ -1,4 +1,4 @@
-# Part 2: dbt Project Configuration
+# dbt Project Configuration
 
 ## Overview
 Configure dbt Core project with Snowflake connection, install required packages, and establish project structure.
